@@ -310,13 +310,8 @@ function basicAuthChallenge(res, realm, message) {
   return res.status(401).send(message);
 }
 
-function isSetupPath(pathname) {
-  const p = String(pathname || "");
-  return p === "/setup" || p.startsWith("/setup/");
-}
-
 function requiresAppAuth(pathname) {
-  return Boolean(APP_PASSWORD) && !isSetupPath(pathname);
+  return Boolean(APP_PASSWORD);
 }
 
 function validateAppAuth(req, pathname) {
@@ -1413,7 +1408,7 @@ app.use(async (req, res) => {
   clearAppAuthHeader(req, req.path);
 
   // If not configured, force users to /setup for any non-setup routes.
-  if (!isConfigured() && !isSetupPath(req.path)) {
+  if (!isConfigured()) {
     return res.redirect("/setup");
   }
 

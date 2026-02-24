@@ -310,8 +310,13 @@ function basicAuthChallenge(res, realm, message) {
   return res.status(401).send(message);
 }
 
+function isSetupPath(pathname) {
+  const p = String(pathname || "");
+  return p === "/setup" || p.startsWith("/setup/");
+}
+
 function requiresAppAuth(pathname) {
-  return Boolean(APP_PASSWORD) && !String(pathname || "").startsWith("/setup");
+  return Boolean(APP_PASSWORD) && !isSetupPath(pathname);
 }
 
 function validateAppAuth(req, pathname) {
@@ -1351,9 +1356,9 @@ app.post("/setup/import", requireSetupAuth, async (req, res) => {
       gzip: true,
       strict: true,
       onwarn: () => {},
-      filter: (p) => {
+      filter: (p, entry) => {
         // Allow only paths that look safe.
-        return looksSafeTarPath(p);
+        return looksSafeTarPath(p) && entry?.type !== "SymbolicLink" && entry?.type !== "Link";
       },
     });
 
@@ -1408,7 +1413,7 @@ app.use(async (req, res) => {
   clearAppAuthHeader(req, req.path);
 
   // If not configured, force users to /setup for any non-setup routes.
-  if (!isConfigured() && !req.path.startsWith("/setup")) {
+  if (!isConfigured() && !isSetupPath(req.path)) {
     return res.redirect("/setup");
   }
 

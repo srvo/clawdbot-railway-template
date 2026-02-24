@@ -42,6 +42,8 @@ const WORKSPACE_DIR =
 
 // Protect /setup with a user-provided password.
 const SETUP_PASSWORD = process.env.SETUP_PASSWORD?.trim();
+// Optional app-wide Basic Auth. Falls back to SETUP_PASSWORD for one-password setups.
+const APP_PASSWORD = process.env.APP_PASSWORD?.trim() || SETUP_PASSWORD;
 
 // Gateway admin token (protects OpenClaw gateway + Control UI).
 // Must be stable across restarts. If not provided via env, persist it in the state dir.
@@ -279,20 +281,80 @@ function requireSetupAuth(req, res, next) {
       .send("SETUP_PASSWORD is not set. Set it in Railway Variables before using /setup.");
   }
 
-  const header = req.headers.authorization || "";
-  const [scheme, encoded] = header.split(" ");
-  if (scheme !== "Basic" || !encoded) {
-    res.set("WWW-Authenticate", 'Basic realm="OpenClaw Setup"');
-    return res.status(401).send("Auth required");
+  const password = readBasicPassword(req.headers.authorization);
+  if (password === null) {
+    return basicAuthChallenge(res, "OpenClaw Setup", "Auth required");
   }
-  const decoded = Buffer.from(encoded, "base64").toString("utf8");
-  const idx = decoded.indexOf(":");
-  const password = idx >= 0 ? decoded.slice(idx + 1) : "";
   if (password !== SETUP_PASSWORD) {
-    res.set("WWW-Authenticate", 'Basic realm="OpenClaw Setup"');
-    return res.status(401).send("Invalid password");
+    return basicAuthChallenge(res, "OpenClaw Setup", "Invalid password");
   }
   return next();
+}
+
+function readBasicPassword(authHeader) {
+  const [scheme, encoded] = String(authHeader || "").split(" ");
+  if (scheme !== "Basic" || !encoded) {
+    return null;
+  }
+  try {
+    const decoded = Buffer.from(encoded, "base64").toString("utf8");
+    const idx = decoded.indexOf(":");
+    return idx >= 0 ? decoded.slice(idx + 1) : "";
+  } catch {
+    return null;
+  }
+}
+
+function basicAuthChallenge(res, realm, message) {
+  res.set("WWW-Authenticate", `Basic realm=\"${realm}\"`);
+  return res.status(401).send(message);
+}
+
+function requiresAppAuth(pathname) {
+  return Boolean(APP_PASSWORD) && !String(pathname || "").startsWith("/setup");
+}
+
+function validateAppAuth(req, pathname) {
+  if (!requiresAppAuth(pathname)) {
+    return { ok: true };
+  }
+  const password = readBasicPassword(req.headers.authorization);
+  if (password === null) {
+    return { ok: false, message: "Auth required" };
+  }
+  if (password !== APP_PASSWORD) {
+    return { ok: false, message: "Invalid password" };
+  }
+  return { ok: true };
+}
+
+function clearAppAuthHeader(req, pathname) {
+  if (requiresAppAuth(pathname)) {
+    delete req.headers.authorization;
+  }
+}
+
+function challengeUpgradeBasicAuth(socket, message) {
+  const body = `${message}\n`;
+  const response = [
+    "HTTP/1.1 401 Unauthorized",
+    'WWW-Authenticate: Basic realm="OpenClaw"',
+    "Content-Type: text/plain; charset=utf-8",
+    `Content-Length: ${Buffer.byteLength(body)}`,
+    "Connection: close",
+    "",
+    body,
+  ].join("\r\n");
+  try {
+    socket.write(response);
+  } catch {
+    // ignore
+  }
+  try {
+    socket.destroy();
+  } catch {
+    // ignore
+  }
 }
 
 const app = express();
@@ -1339,6 +1401,12 @@ function attachGatewayAuthHeader(req) {
 }
 
 app.use(async (req, res) => {
+  const auth = validateAppAuth(req, req.path);
+  if (!auth.ok) {
+    return basicAuthChallenge(res, "OpenClaw", auth.message);
+  }
+  clearAppAuthHeader(req, req.path);
+
   // If not configured, force users to /setup for any non-setup routes.
   if (!isConfigured() && !req.path.startsWith("/setup")) {
     return res.redirect("/setup");
@@ -1379,6 +1447,7 @@ const server = app.listen(PORT, "0.0.0.0", async () => {
 
   console.log(`[wrapper] gateway token: ${OPENCLAW_GATEWAY_TOKEN ? "(set)" : "(missing)"}`);
   console.log(`[wrapper] gateway target: ${GATEWAY_TARGET}`);
+  console.log(`[wrapper] app password: ${APP_PASSWORD ? "(set)" : "(disabled)"}`);
   if (!SETUP_PASSWORD) {
     console.warn("[wrapper] WARNING: SETUP_PASSWORD is not set; /setup will error.");
   }
@@ -1418,6 +1487,21 @@ const server = app.listen(PORT, "0.0.0.0", async () => {
 });
 
 server.on("upgrade", async (req, socket, head) => {
+  const pathname = (() => {
+    try {
+      return new URL(req.url || "/", "http://localhost").pathname;
+    } catch {
+      return req.url || "/";
+    }
+  })();
+
+  const auth = validateAppAuth(req, pathname);
+  if (!auth.ok) {
+    challengeUpgradeBasicAuth(socket, auth.message);
+    return;
+  }
+  clearAppAuthHeader(req, pathname);
+
   if (!isConfigured()) {
     socket.destroy();
     return;
